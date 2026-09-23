@@ -1,144 +1,126 @@
-# Rollback Guide
+# Partial Crate Rollback Guide
 
-This guide covers how to recover from a bad contract deployment on Stellar/Soroban.
-See also [`rollback-deploy.md`](rollback-deploy.md) for the full strategy reference.
+This guide is the canonical reference for **partial crate rollback** in `mux-contracts`.
+It defines what may be rolled back, what must remain the source of truth, and how
+rollback operations fail closed. It is written for Stellar Wave contributors and
+operators touching AA/wallet/payment paths.
 
----
+> Scope: partial rollback only. Full-chain reorgs, irreversible mainnet ops, and
+> unrelated refactors are out of scope.
 
-## 1. Identify a Bad Deploy
+## 1. Invariants
 
-Signs of a bad deploy:
+These invariants MUST hold for every partial rollback. A rollback that cannot
+satisfy all of them MUST be rejected (fail closed).
 
-- Transactions against the new contract fail with unexpected error codes
-- Admin or user-facing calls revert unexpectedly
-- On-chain state is inconsistent with what the contract should have initialised
-- Monitoring alerts fire on the new contract ID shortly after deployment
-- The deployment script exited non-zero, or the post-deploy smoke test failed
+1. **Server/contract is the source of truth.** Spends, recovery, and admin state
+   are authoritative on-chain / server-side. Client-supplied rollback intent is a
+   *request*, never a fact.
+2. **Partial only.** A rollback may revert a bounded, identified set of crate
+   state (e.g. a single crate version's storage keys or a single operation batch).
+   It MUST NOT revert unrelated crates, global config, or ownership.
+3. **Monotonic safety.** Rollback MUST NOT resurrect already-finalized spends or
+   re-enable a revoked delegate/guardian.
+4. **Idempotent.** Replaying the same rollback request (same correlation id) MUST
+   be a no-op after the first successful application.
+5. **Fail closed on writes.** If the RPC/DB/Horizon dependency is unavailable or
+   returns an ambiguous result, the rollback MUST abort without mutating state.
+6. **Deny by default.** Any new privileged rollback surface is unauthorized until
+   an explicit role grants it.
 
-Gather the following before acting:
+## 2. Typed APIs and entrypoints
 
-```bash
-# Confirm which contract ID is currently live
-cat config/addresses.json | python3 -m json.tool | grep -A6 '"mainnet"'
+Rollback entrypoints are typed and return stable error codes. Correlation ids are
+required so operators can trace a rollback across logs and metrics.
 
-# Retrieve the transaction hash of the deploy
-stellar contract info --id <CONTRACT_ID> --network mainnet
+```ts
+// bindings/rollback.ts (shape reference)
+export interface PartialRollbackRequest {
+  /** Bounded target: crate id + version range to revert. */
+  crateId: string;
+  fromVersion: string;
+  toVersion: string;
+  /** Idempotency key; reused on retry. */
+  correlationId: string;
+  /** Actor identity resolved server-side; never trusted from the body. */
+  actor: RollbackActor;
+}
+
+export type RollbackActor =
+  | { kind: "owner" }
+  | { kind: "delegate"; delegateId: string }
+  | { kind: "guardian"; guardianId: string };
+
+export interface PartialRollbackResult {
+  correlationId: string;
+  status: "applied" | "noop" | "rejected";
+  errorCode?: RollbackErrorCode;
+}
 ```
 
-Record the broken contract ID, the deployment timestamp, and the exact error.
+### Stable error codes
 
----
+| Code | Meaning |
+|------|---------|
+| `RB_ROLLBACK_UNAUTHORIZED` | Actor lacks the required role for this crate. |
+| `RB_ROLLBACK_OUT_OF_SCOPE` | Target is not a bounded partial rollback. |
+| `RB_ROLLBACK_REPLAYED` | Correlation id already applied (idempotent no-op). |
+| `RB_ROLLBACK_DEPENDENCY_DOWN` | RPC/DB/Horizon unavailable; aborted, no writes. |
+| `RB_ROLLBACK_CONFLICT` | Target state changed since request; re-read and retry. |
+| `RB_ROLLBACK_INVALID_INPUT` | Malformed or oversized request. |
 
-## 2. Options
+## 3. Authorization
 
-| Option | When to Use | User-State Impact |
-|---|---|---|
-| Re-point `config/addresses.json` to previous ID | No user txns on new contract | None — previous contract is untouched |
-| Redeploy previous WASM as a new instance | Previous ID unusable (factory pattern) | None if migrated before cutover |
-| Admin pause / freeze new contract | Users already transacted; state must be preserved | Paused; requires contract pause support |
+Every rollback entrypoint is authorized server-side. Clients cannot bypass policy
+by supplying an actor in the request body.
 
-Full command sequences for each option are in [`rollback-deploy.md`](rollback-deploy.md).
+- **owner** — may roll back any crate they own.
+- **delegate** — may roll back only crates explicitly delegated to them; a revoked
+  delegate is rejected (`RB_ROLLBACK_UNAUTHORIZED`).
+- **guardian** — may roll back only within the guardian's recovery scope.
+- **API-key / JWT** — must be valid, unexpired, and carry the rollback scope; an
+  expired or wrong-role token is rejected.
 
----
+Deny by default: a new rollback surface ships disabled until a role is granted.
 
-## 3. Step-by-Step Rollback Commands
+## 4. Observability (ops-safe)
 
-### Option A — Re-point to previous contract ID (fastest)
+Rollback paths emit actionable errors and metrics **without leaking secrets**.
 
-```bash
-# 1. Find the previous contract ID from git history
-git log --oneline -- config/addresses.json
-git show <PREV_COMMIT>:config/addresses.json | python3 -m json.tool | grep -A6 '"mainnet"'
+Metrics:
 
-# 2. Edit config/addresses.json to restore the previous IDs
-#    (muxAccount, muxBatcher, muxPermissions, etc.)
+- `rollback_requests_total{status,error_code}`
+- `rollback_applied_total{crate_id}`
+- `rollback_dependency_failures_total{dependency}`
 
-# 3. Regenerate TypeScript bindings
-bash scripts/generate-bindings.sh --network mainnet --skip-build
-cd bindings && npm run build && npm test
+Logs MUST redact:
 
-# 4. Open a PR, merge, publish a new bindings patch release
-```
+- private keys / seed phrases / raw key material
+- JWTs and API keys (log only a short hash or last-4 fingerprint)
+- webhook secrets
 
-### Option B — Redeploy previous WASM
+Log the `correlationId`, `crateId`, `fromVersion`/`toVersion`, resolved role, and
+`errorCode`. Never log request bodies verbatim.
 
-```bash
-# 1. Check out the last known-good release tag
-git checkout v<PREVIOUS_VERSION>
+## 5. Failure modes
 
-# 2. Build the old WASM
-cargo build --target wasm32-unknown-unknown --release --workspace
+| Failure | Required behavior |
+|---------|-------------------|
+| Concurrent / replayed request | Idempotent via `correlationId`; second call returns `noop`. |
+| RPC/DB/Horizon outage | Abort with `RB_ROLLBACK_DEPENDENCY_DOWN`; no writes. |
+| Auth expiry / wrong role / revoked delegate | Reject with `RB_ROLLBACK_UNAUTHORIZED`. |
+| Oversized batch / griefing / spoofed webhook | Reject with `RB_ROLLBACK_INVALID_INPUT`; rate-limit entrypoint. |
+| Testnet vs mainnet misconfig | Refuse to run; require explicit network passphrase match. |
 
-# 3. Dry-run first
-MUX_DEPLOYER_SECRET=S... bash scripts/deploy-testnet.sh --dry-run --network mainnet
+## 6. Rollback and flag strategy
 
-# 4. Deploy
-MUX_DEPLOYER_SECRET=S... bash scripts/deploy.sh --network mainnet
+- Ship money-path or mainnet-affecting rollback changes behind a feature flag /
+  kill-switch, default off.
+- Document the flag name and the exact steps to disable it in the PR description.
+- A rollback of a rollback is itself a partial rollback and follows this guide.
 
-# 5. Record new contract IDs in config/addresses.json and open a PR
-```
+## 7. Related docs
 
-### Option C — Admin pause (state-preserving)
-
-```bash
-# Pause the broken contract (requires contract to implement set_active or pause)
-stellar contract invoke \
-  --id <BROKEN_CONTRACT_ID> \
-  --network mainnet \
-  --source <ADMIN_SECRET_KEY> \
-  -- set_active --active false
-
-# Deploy the fixed version, migrate state, re-enable
-```
-
----
-
-## 4. Verify the Rollback Succeeded
-
-After restoring the previous contract or redeploying:
-
-```bash
-# Confirm each contract responds
-stellar contract invoke \
-  --id <RESTORED_CONTRACT_ID> \
-  --network mainnet \
-  -- version
-
-# Confirm admin address is correct
-stellar contract invoke \
-  --id <RESTORED_CONTRACT_ID> \
-  --network mainnet \
-  -- get_admin
-
-# Run bindings smoke tests
-cd bindings && npm test
-```
-
-All three checks must pass before the rollback is considered complete.
-
----
-
-## 5. Who to Notify
-
-| Audience | Channel | Timing |
-|---|---|---|
-| On-call engineer | Incident channel / PagerDuty | Immediately on detection |
-| Core team | Team Slack / Signal | Before executing rollback |
-| Dependent service owners | Direct message or shared incident thread | After rollback is confirmed |
-| Mux Labs multisig holders | Out-of-band (required for mainnet upgrade authority) | If admin action is required |
-
-Post a brief incident report after the rollback is stable:
-- What failed and why
-- How it was detected
-- Which rollback strategy was used
-- Follow-up issue link for the root-cause fix
-
----
-
-## Related Documents
-
-- [`rollback-deploy.md`](rollback-deploy.md) — full rollback strategy reference
-- [`mainnet-deploy-checklist.md`](mainnet-deploy-checklist.md) — pre-deploy checklist
-- [`deployer-key.md`](deployer-key.md) — deployer key setup
-- [`BREAKING_CHANGES.md`](BREAKING_CHANGES.md) — record of breaking changes
-- [`../scripts/deploy.sh`](../scripts/deploy.sh) — deployment script
+- [SECURITY.md](../SECURITY.md) — reporting and threat model.
+- [docs/threat-model.md](threat-model.md) — trust boundaries.
+- [docs/access-control-checklist.md](access-control-checklist.md) — authz review.
