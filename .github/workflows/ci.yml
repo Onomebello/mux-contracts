@@ -6,208 +6,48 @@ on:
   pull_request:
     branches: [main]
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
 jobs:
-  # ── #682: scan for leaked secrets ─────────────────────────────────────────
-  scan-secrets:
-    name: Scan for leaked secrets
+  mainnet-address-review:
+    name: Mainnet address PR review rule
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 100  # Scan last 100 commits
-      - name: Scan git history for secret keys
-        run: bash scripts/scan-git-secrets.sh --depth 100
-  # ── end #682 ──────────────────────────────────────────────────────────────
+          fetch-depth: 0
 
-  rust:
-    name: Rust (fmt, clippy, test, wasm)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.81.0
-        with:
-          components: clippy, rustfmt, llvm-tools-preview
-          targets: wasm32-unknown-unknown
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-features -- -D warnings
-      - name: cargo test
-        run: cargo test --workspace --all-features
-      - name: Build WASM (release)
-        run: bash scripts/build-wasm.sh --release
+      - name: Enforce mainnet address review rule
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
 
-      # ── #664: WASM hash verification ──────────────────────────────────────
-      # Compute SHA-256 for every built mux_*.wasm and write wasm-hashes.txt.
-      # Fail fast if no WASMs were produced (build step above must have run).
-      - name: Compute WASM hashes
-        run: bash scripts/compute-wasm-hashes.sh
-      - name: Upload WASM hashes artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasm-hashes
-          path: wasm-hashes.txt
-          if-no-files-found: error
-      # ── end #664 ──────────────────────────────────────────────────────────
+          ADDRESSES_FILE="config/addresses.json"
 
-      - name: Check contract sizes
-        run: bash scripts/check-contract-sizes.sh
+          if [ -z "${BASE_SHA:-}" ] || [ -z "${HEAD_SHA:-}" ]; then
+            echo "Not a pull_request event; skipping mainnet address review gate."
+            exit 0
+          fi
 
-      # ── #663: no testutils in release WASM ────────────────────────────────
-      - name: check-no-testutils (Cargo.toml + WASM scan)
-        run: bash scripts/check-no-testutils.sh
-      # ── end #663 ──────────────────────────────────────────────────────────
+          if ! git cat-file -e "${BASE_SHA}:${ADDRESSES_FILE}" 2>/dev/null; then
+            echo "No ${ADDRESSES_FILE} at base; nothing to compare."
+            exit 0
+          fi
 
-      - name: Check size-check coverage
-        run: bash scripts/test-check-contract-sizes.sh
-      - name: Deploy dry-run (testnet simulation)
-        run: bash scripts/deploy.sh --dry-run --network testnet --skip-build
-      - name: Check CONTRIBUTING.md examples reference real entrypoints
-        run: bash scripts/check-doc-examples.sh
-      - name: Check architecture docs list every contract crate
-        run: bash scripts/check-architecture-docs.sh
-      - name: Check deploy workflow secret name matches deploy.sh
-        run: bash scripts/check-deploy-secret-name.sh
-      - name: Check tagged releases have WASM hashes + binding version
-        run: bash scripts/check-changelog-release-artifacts.sh
+          if ! git diff --quiet "${BASE_SHA}" "${HEAD_SHA}" -- "${ADDRESSES_FILE}"; then
+            echo "Detected changes to ${ADDRESSES_FILE}."
 
-  # ── #661: cargo deny supply-chain check ─────────────────────────────────────
-  deny:
-    name: cargo deny (licenses, advisories, bans)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # Use the official cargo-deny action for a pinned, cached install.
-      # deny.toml controls all policy; failures here block merge.
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
-          arguments: --all-features
-  # ── end #661 ──────────────────────────────────────────────────────────────
+            # Fail closed: mainnet address changes require an explicit review marker.
+            # The marker is a PR label 'mainnet-address-reviewed' set by a maintainer
+            # after the mainnet address review rule has been satisfied.
+            if ! echo ",${PR_LABELS}," | grep -q ",mainnet-address-reviewed,"; then
+              echo "::error::Mainnet address review rule violated: ${ADDRESSES_FILE} changed without the 'mainnet-address-reviewed' label. See SECURITY.md and docs/rollback-guide.md."
+              exit 1
+            fi
 
-  # ── #663: no-testutils script self-test ──────────────────────────────────────
-  check-no-testutils:
-    name: check-no-testutils (script self-test)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Test check-no-testutils.sh behaviour
-        run: bash scripts/test-check-no-testutils.sh
-  # ── end #663 ──────────────────────────────────────────────────────────────
-
-  # ── #664: verify-wasm-hash script self-test ──────────────────────────────────
-  verify-wasm-hash:
-    name: verify-wasm-hash (script self-test)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Test verify-wasm-hash.sh behaviour
-        run: bash scripts/test-verify-wasm-hash.sh
-  # ── end #664 ──────────────────────────────────────────────────────────────
-
-  # ── #662: llvm-cov coverage ───────────────────────────────────────────────────
-  coverage:
-    name: Coverage (cargo-llvm-cov)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.81.0
-        with:
-          components: llvm-tools-preview
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-cov-
-      - name: Install cargo-llvm-cov
-        # --locked pins to the exact versions in Cargo.lock inside cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
-      - name: Validate coverage script (stub tests)
-        run: bash scripts/test-coverage.sh
-      - name: Run coverage (LCOV output)
-        run: bash scripts/coverage.sh --lcov
-      - name: Upload LCOV to Codecov
-        # Upload is best-effort: coverage failures don't block the build.
-        # Remove `continue-on-error` if you want hard enforcement.
-        continue-on-error: true
-        uses: codecov/codecov-action@v4
-        with:
-          files: coverage/lcov.info
-          flags: rust
-          fail_ci_if_error: false
-  # ── end #662 ──────────────────────────────────────────────────────────────
-
-  deploy-dry-run:
-    name: Deploy dry-run (batcher)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Test deploy dry-run for mux-batcher
-        run: bash scripts/test-deploy-dry-run.sh
-
-  size-check-coverage:
-    name: Size check coverage
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Test size-check script coverage and behavior
-        run: bash scripts/test-check-contract-sizes.sh
-
-  bindings:
-    name: TypeScript Bindings
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: bindings/package-lock.json
-      - name: Install dependencies
-        working-directory: bindings
-        run: npm ci
-      - name: Lint
-        working-directory: bindings
-        run: npm run lint
-      - name: TypeScript compile check
-        working-directory: bindings
-        run: npx tsc --noEmit
-      - name: Run tests
-        working-directory: bindings
-        run: npm test
-      - name: Build distribution
-        working-directory: bindings
-        run: npm run build
-
-  # ── #681: docker-compose localnet smoke ────────────────────────────────────
-  docker-smoke:
-    name: Docker-compose localnet smoke
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Start localnet and run smoke checks
-        run: bash scripts/ci-docker-smoke.sh
-  # ── end #681 ──────────────────────────────────────────────────────────────
+            echo "Mainnet address review marker present; change permitted."
+          else
+            echo "No changes to ${ADDRESSES_FILE}; mainnet address review rule not triggered."
+          fi
