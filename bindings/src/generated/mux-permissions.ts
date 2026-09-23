@@ -25,6 +25,21 @@ export interface MuxPermissionsClientOptions {
   rpcUrl: string;
 }
 
+/**
+ * Role inheritance model (see docs/permissions-role-model.md).
+ *
+ * A role may declare a parent role; a member of a child role inherits every
+ * permission granted to its ancestors. Inheritance is strictly upward: a child
+ * can never grant permissions beyond those declared on its parent chain, so
+ * privilege escalation outside the declared hierarchy is denied by default.
+ */
+export interface RoleDefinition {
+  role: string;
+  permissions: string[];
+  /** Parent role whose permissions are inherited. `null` for root roles. */
+  parent: string | null;
+}
+
 export class MuxPermissionsClient {
   private contract: Contract;
   private server: SorobanRpc.Server;
@@ -46,11 +61,15 @@ export class MuxPermissionsClient {
   async createRole(
     sourceKeypair: Keypair,
     role: string,
-    permissions: string[]
+    permissions: string[],
+    parent: string | null = null
   ): Promise<void> {
     const tx = await this.buildTx(sourceKeypair, "create_role", [
       xdr.ScVal.scvSymbol(role),
       xdr.ScVal.scvVec(permissions.map((p) => xdr.ScVal.scvSymbol(p))),
+      parent === null
+        ? xdr.ScVal.scvVoid()
+        : xdr.ScVal.scvSymbol(parent),
     ]);
     await this.submit(tx, sourceKeypair);
   }
@@ -106,6 +125,36 @@ export class MuxPermissionsClient {
       xdr.ScVal.scvSymbol(role),
     ]);
     return this.simulateRead<Address[]>(tx);
+  }
+
+  /**
+   * Returns the declared role definition, including its parent link, so callers
+   * and tests can assert the inheritance hierarchy without re-deriving it.
+   */
+  async getRoleDefinition(
+    sourceKeypair: Keypair,
+    role: string
+  ): Promise<RoleDefinition> {
+    const tx = await this.buildTx(sourceKeypair, "get_role_definition", [
+      xdr.ScVal.scvSymbol(role),
+    ]);
+    return this.simulateRead<RoleDefinition>(tx);
+  }
+
+  /**
+   * Resolves the effective permission set for a role by walking the declared
+   * parent chain. Mirrors the on-chain inheritance semantics so tests can
+   * assert child roles inherit parent permissions and never escalate beyond
+   * the declared hierarchy.
+   */
+  async getEffectivePermissions(
+    sourceKeypair: Keypair,
+    role: string
+  ): Promise<string[]> {
+    const tx = await this.buildTx(sourceKeypair, "get_effective_permissions", [
+      xdr.ScVal.scvSymbol(role),
+    ]);
+    return this.simulateRead<string[]>(tx);
   }
 
   // ── Multisig Admin ──────────────────────────────────────────────────────────
