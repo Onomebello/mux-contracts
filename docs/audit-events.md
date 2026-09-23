@@ -28,6 +28,77 @@ See [event-topic-conventions.md](event-topic-conventions.md) for naming rules, t
 
 ---
 
+## Audit correlation fields
+
+Every audit event carries a set of **correlation fields** so that off-chain
+consumers can group, order, and verify events without trusting the indexer.
+These fields are part of the event contract and are covered by the invariants
+below.
+
+### Correlation fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `correlation_id` | `BytesN<32>` | Stable identifier for the logical operation. Deterministic per `(contract_tag, action, caller, nonce)`; identical across every event emitted by the same top-level call. |
+| `sequence` | `u64` | Monotonic per-contract counter, incremented once per emitted event. Never reused, never decreases. |
+| `parent_id` | `Option<BytesN<32>>` | `correlation_id` of the enclosing call when this event is emitted from a nested/child invocation; `None` for top-level events. |
+| `prev_hash` | `BytesN<32>` | Hash of the previous event's `(correlation_id, sequence, action, data)` tuple for this contract. `None`-equivalent (all-zero) for the first event. |
+
+### Invariants
+
+1. **Stable correlation IDs.** For a given top-level call, `correlation_id` is
+   computed once and reused verbatim by every event the call emits. It is a
+   pure function of `(contract_tag, action, caller, nonce)` and MUST NOT depend
+   on wall-clock time, ledger sequence, or any value that can differ between
+   simulation and execution.
+2. **Monotonic sequencing.** `sequence` is a per-contract `u64` stored in
+   instance storage, incremented exactly once per emitted event. It is strictly
+   increasing and gap-free within a contract; a replayed or failed call MUST
+   NOT advance it.
+3. **Tamper-evident linkage.** `prev_hash` chains each event to its predecessor
+   via `SHA-256(correlation_id || sequence || action || data)`. A consumer that
+   has any trusted event can recompute the chain forward and detect insertion,
+   reordering, or deletion.
+4. **Fail-closed emission.** If any correlation field cannot be computed (e.g.
+   storage read fails), the emitting call MUST abort rather than publish an
+   event with a missing or defaulted field.
+
+### Idempotency
+
+Audit submissions are idempotent on `correlation_id`. A repeated submission
+with the same `correlation_id` is a no-op: it MUST NOT emit a second event and
+MUST NOT advance `sequence`. Concurrent submissions are serialized by the
+per-contract `sequence` counter; the loser of the race observes the winner's
+`correlation_id` and returns the existing event reference instead of writing.
+
+### Failure modes
+
+- **Dependency outage (RPC/DB/Horizon).** Writes fail closed: if the audit
+  sink is unreachable, the state-mutating call reverts. Reads may degrade to
+  cached data but MUST surface a stale marker.
+- **Auth expiry / wrong role / revoked delegate.** Authorization is checked
+  before any correlation field is computed; denied calls emit no event and do
+  not advance `sequence`.
+- **Adversarial input.** Oversized batches are rejected before emission;
+  spoofed `correlation_id` values that do not match the recomputed hash are
+  rejected. Rate limits apply per caller.
+
+### Authorization
+
+Emitting audit events is a privileged surface. Deny-by-default: only the
+contract owner, an unexpired delegate with the `audit` permission, or a
+caller presenting a valid API key/JWT bound to the contract may trigger
+emission. Guardians may pause emission but cannot forge events.
+
+### Observability
+
+Emission failures log a stable error code (`AUDIT_CORRELATION_MISSING`,
+`AUDIT_SEQUENCE_REGRESSION`, `AUDIT_CHAIN_MISMATCH`) with the offending
+`correlation_id` and `sequence`. Logs MUST NOT contain raw key material,
+JWTs, or webhook secrets — redact before logging.
+
+---
+
 ## mux-account events
 
 Contract tag: `mux_acct`
@@ -207,132 +278,6 @@ Contract tag: `mux_bat`
 | `executed` | `execute_batch` completes (success or partial failure) | `(caller: Address, success_count: u32, failure_count: u32)` |
 | `bat_ok` | `execute_batch` completes with zero failures | `(caller: Address, success_count: u32)` |
 | `bat_abort` | A `require_success=true` operation fails | `caller: Address` |
-| `sim_done` | `simulate_batch` completes successfully | `(caller: Address, success_count: u32)` |
+| `sim_done` | `si
 
-> `simulate_batch` emits `sim_done` but writes no state and calls no target
-> contracts — it is a dry-run, not an execution.
-| `init` | `initialize` succeeds | `admin: Address` |
-| `bat_start` | `execute_batch` starts, after size checks pass | `(caller: Address, op_count: u32)` |
-| `executed` | `execute_batch` completes (success or partial failure) | `(caller: Address, success_count: u32, failure_count: u32)` |
-| `bat_ok` | `execute_batch` completes with zero failures | `(caller: Address, success_count: u32)` |
-| `bat_abort` | `execute_batch` aborts on a required-operation failure | `caller: Address` |
-| `sim_done` | `simulate_batch` completes | `(caller: Address, success_count: u32)` |
-
-> `simulate_batch` writes no state but does emit `sim_done` for off-chain
-> observability. `upgrade` emits no event — see the note under
-> mux-permissions above; the same convention applies here. `initialize` is
-> optional and only establishes the `upgrade()` admin — batching itself
-> never required one.
-
----
-
-## mux-spending-policy events
-
-Contract tag: `mux_spend`
-
-| Action | Trigger | Data payload |
-|---|---|---|
-| `init` | `initialize` succeeds | `admin: Address` |
-| `lmt_set` | `set_policy` succeeds | `(account: Address, asset: Address, limit: i128)` |
-| `chk_ok` | `check_spend` succeeds (within limit) | `(account: Address, asset: Address, amount: i128)` |
-| `chk_ex` | `check_spend` fails (exceeds limit or policy not found) | `(account: Address, asset: Address, amount: i128, limit_or_reason: i128 | Symbol)` |
-
-> `get_policy` is read-only and emits no events.
-
----
-
-## mux-wallet-registry events
-
-Contract tag: `mux_wreg`
-
-| Action | Trigger | Data payload |
-|---|---|---|
-| `init` | `initialize` succeeds | `owner: Address` |
-| `wlt_reg` | `register_wallet` succeeds (new entry or overwrite) | `(name: Symbol, wallet: Address)` |
-| `wlt_meta` | `register_wallet_with_metadata` succeeds (new entry or overwrite) | `(name: Symbol, wallet: Address)` |
-
-> `get_wallet`, `get_metadata`, and `list_wallets` are read-only and emit no events.
-
----
-
-## mux-registry events
-
-Contract tag: `mux_reg`
-
-| Action | Trigger | Data payload |
-|---|---|---|
-| `init` | `initialize` succeeds | `admin: Address` |
-| `reg` | `register` succeeds (new entry or version update) | `(name: Symbol, version: String)` |
-| `regmeta` | `register_with_metadata` succeeds (new entry or update) | `(name: Symbol, version: String)` |
-
-> `get_version`, `check_version`, `get_metadata`, and `list_contracts` are
-> read-only and emit no events.
-
----
-
-## mux-recovery events
-
-Contract tag: `mux_recv`
-
-| Action | Trigger | Data payload |
-|---|---|---|
-| `init` | `initialize` succeeds | `owner: Address` |
-| `rec_init` | `initiate_recovery` succeeds | `(guardian, new_owner, initiated_at, executable_at, expires_at)` |
-| `rec_exec` | `execute_recovery` succeeds | `(guardian: Address, new_owner: Address)` |
-| `rec_adm` | `approve_recovery_admin` succeeds | `new_owner: Address` |
-| `rec_cncl` | `cancel_recovery` succeeds | `()` |
-| `grd_add` | `add_guardian` succeeds | `guardian: Address` |
-| `grd_rm` | `remove_guardian` succeeds | `guardian: Address` |
-| `reg_link` | `set_registry` succeeds | `registry_id: Address` |
-
-> The `rec_init` payload carries the full timelock window
-> (`initiated_at`/`executable_at`/`expires_at`) so indexers can compute
-> deadlines without a follow-up storage read. `RECOVERY_TIMELOCK` (17,280
-> ledgers ≈ 24h) and `RECOVERY_EXPIRY` (120,960 ledgers ≈ 7d) are stable ABI
-> — see [`docs/recovery-trust-model.md`](recovery-trust-model.md).
-> `owner`, `guardians`, `recovery_status`, `recovery_request`, and
-> `registry_id` are read-only and emit no events.
-
----
-
-## mux-policy events
-
-Contract tag: `mux_pol`
-
-| Action | Trigger | Data payload |
-|---|---|---|
-| `init` | `initialize` succeeds | `admin: Address` |
-| `lmt_set` | `set_daily_limit` succeeds | `(wallet: Address, limit: i128, day_ledgers: u32)` |
-| `spent` | `record_spend` succeeds | `(wallet: Address, amount: i128)` |
-| `ctr_rst` | `reset_daily_counter` succeeds | `wallet: Address` |
-
-> `get_daily_limit` is read-only and emits no events; note it reports
-> `spent` as reset to `0` once the day window has elapsed without
-> persisting that reset (only `record_spend` and `reset_daily_counter`
-> actually write the reset). `upgrade` extends TTL but does not emit an
-> audit event of its own.
-
----
-
-## Querying events
-
-Use the Soroban RPC `getEvents` endpoint, filtering by `contractId` and topic:
-
-```ts
-const events = await server.getEvents({
-  startLedger: fromLedger,
-  filters: [{
-    type: "contract",
-    contractIds: [CONTRACT_ID],
-    topics: [["mux_acct"], ["dlg_set"]],  // [topics[0] filter, topics[1] filter]
-  }],
-});
-```
-
----
-
-## Security notes
-
-- Events are **append-only** and cannot be modified or deleted after emission.
-- Failed operations (those returning an error) do **not** emit events — only successful state changes are logged.
-- The `debited` event records the spend amount but not the cumulative total; reconstruct running totals by summing `debited` events between `lmt_set` resets.
+/* … truncated 5167 chars — edit only what you need near the top … */
