@@ -45,19 +45,37 @@ Rules:
 
 Tags are snake-ish abbreviations under 9 chars. Do not reuse a tag across crates.
 
+## Repository-wide short-tag registry
+
+Contract tags (`topics[0]`) identify the emitting crate. The action tag in `topics[1]` is normally interpreted together with that contract tag as the stable key `contract_tag/action`. A small set of short action tags is also consumed by shared Mux indexer pipelines and therefore has a **repository-wide uniqueness reservation**. These tags must not be assigned to a different action in another contract:
+
+| Reserved action tag | Contract | Event | Indexer meaning |
+|---|---|---|---|
+| `ses_exe` | `mux-account` | `execute_with_session`, `execute_with_session_sponsored` | A session-authorized call was dispatched and completed |
+| `spn_set` | `mux-account` | `set_sponsor` | A relayer was added to or removed from the sponsorship allowlist |
+| `bat_ok` | `mux-batcher` | `execute_batch` | A batch completed with zero failures |
+| `rec_init` | `mux-recovery` | `initiate_recovery` | A recovery timelock was started |
+
+Before introducing a new globally indexed short tag, search this document and [Audit Log Events](audit-events.md), then reserve the tag here in the same change. Reusing generic action names such as `init` is allowed only when consumers filter on the full `(topics[0], topics[1])` pair; the reserved tags above are the exception and must remain unique across contracts. Indexers should reject or quarantine an event whose reserved tag appears under a different contract tag or with a different payload schema.
+
+The uniqueness rule is an ABI compatibility requirement: changing one of these tags or its payload shape can silently misclassify events in downstream indexers. Any intentional rename requires updating the bindings, audit-event catalog, and migration notes before deployment.
+
 ## Action naming
 
 | Pattern | Example | Use |
 |---|---|---|
 | Verb-ish past / short noun | `init`, `deployed`, `executed` | One-shot lifecycle |
 | Domain prefix + verb | `dlg_set`, `dlg_rm`, `role_grt` | Domain-scoped mutations |
-| Status / outcome | `bat_ok`, `bat_abort`, `perm_den` | Secondary outcome beside a primary event |
+| Status / outcome | `bat_ok`, `bat_abort` | Secondary outcome beside a primary event |
 
 Guidelines:
 
 - Prefer ≤ 8 characters so `symbol_short!` stays readable.
 - Keep action names unique **within** a contract tag; cross-contract reuse of names like `init` / `meta_set` is fine.
 - Read-only entrypoints (`get_*`, `simulate_*`, `is_*`, `has_*`) emit **no** events.
+  Exception: `mux-permissions::has_permission` emits `perm_ok` on a granted
+  check (a positive audit trail is intentional there) but emits nothing on a
+  denial — see [audit-events.md](audit-events.md#mux-permissions-events).
 
 ## Data payload
 

@@ -10,6 +10,8 @@
 
 ## Overview
 
+For the repository-wide reserved short-tag registry and collision policy, see [Event Topic Conventions — Repository-wide short-tag registry](event-topic-conventions.md#repository-wide-short-tag-registry). The tags `ses_exe`, `bat_ok`, and `rec_init` are reserved for the events documented below and must not be reused for another action in a different contract.
+
 Every state-mutating operation in Mux contracts emits a Soroban event via `env.events().publish(topics, data)`.  
 Events are indexed on-chain and can be streamed from any Soroban RPC node using the `getEvents` method.
 
@@ -103,19 +105,39 @@ JWTs, or webhook secrets — redact before logging.
 
 Contract tag: `mux_acct`
 
+> **Note:** `execute_with_session` scope enforcement (T-40) is now active. When a session key registered with an empty `scopes` list is used, the call is rejected with `Unauthorized` before any state mutation occurs. This rejection does **not** emit a `ses_exe` event (no events on error), but it is counted as an authorization failure and visible in host-level error logs. See [threat-model.md](threat-model.md) T-40 and [entrypoint-matrix.md](entrypoint-matrix.md) for the full fail-closed scope enforcement description.
+
 | Action | Trigger | Data payload |
 |---|---|---|
 | `init` | `initialize` succeeds | `owner: Address` |
+| `paused` | `pause` succeeds | `()` |
 | `unpaused` | `unpause` succeeds | `()` |
 | `dlg_set` | `set_delegate` succeeds | `(delegate: Address, expires_at: u64, can_spend: bool)`; `expires_at` is a Unix timestamp |
 | `dlg_rm` | `remove_delegate` succeeds | `delegate: Address` |
 | `lmt_set` | `set_spend_limit` succeeds | `(asset: Address, amount: i128, period_ledgers: u32)` |
 | `debited` | `debit_spend` succeeds | `(asset: Address, spend: i128)` |
-| `ses_exe` | `execute_with_session` succeeds | `SessionExecutedEvent { session_key: Address, payload_len: u32 }` |
+| `executed` | `execute` succeeds | `(target: Address, asset: Address, spend: i128)` |
+| `ses_exe` | `execute_with_session` or `execute_with_session_sponsored` succeeds | `SessionExecutedEvent { session_key: Address, target: Address, function: Symbol, sponsor: Option<Address> }`; `sponsor` is `None` for the non-sponsored variant |
+| `sk_reg` | `register_session_key` succeeds | `session_key: Address` |
+| `sk_rev` | `revoke_session_key` succeeds | `session_key: Address` |
 | `meta_set` | `set_metadata` succeeds | `name: String` (from the `RegistryMeta` argument) |
 
-> `register_session_key` and `revoke_session_key` do not currently emit
-> dedicated audit events.
+> `execute` follows checks-effects-interactions: the spend limit is checked
+> before `target` is invoked, but the debit is written to storage — and the
+> `executed` event emitted — only after the invocation returns. The
+> reentrancy guard (`DataKey::Executing`) is held for the full duration of
+> the invocation, not just around the storage write, so a callback into
+> `execute`/`debit_spend` from `target` during the call is rejected.
+>
+> `register_session_key` and `revoke_session_key` emit `sk_reg` and `sk_rev`
+> respectively on success only.
+>
+> `execute_with_session` emits `ses_exe` only on the success path — after the
+> target has been invoked and returned. A rejected call — unknown/revoked/expired
+> key, an **empty-scope key rejected fail-closed (T-40)**, a method outside the
+> granted scopes (`ScopeNotGranted`), or an un-allowlisted relayer
+> (`SponsorNotAuthorized`) — emits nothing, matching the no-events-on-error
+> convention.
 
 ---
 
@@ -194,12 +216,15 @@ Contract tag: `mux_perm`
 | `adm_apr` | `approve_admin` records an approval (threshold not yet reached) | `(approver: Address, new_admin: Address)` |
 | `adm_prm` | `approve_admin` promotes a candidate (threshold reached) | `new_admin: Address` |
 | `perm_ok` | `has_permission` returns `true` | `(account: Address, permission: Symbol)` |
-| `perm_den` | `has_permission` returns `false` | `(account: Address, permission: Symbol)` |
 | `meta_set` | `set_metadata` succeeds | `name: String` (from the `RegistryMeta` argument) |
 
-> Unlike every other event in this table, `perm_ok`/`perm_den` are emitted by
-> a read-only query (`has_permission`), not a state-mutating call — every
-> permission check is itself audit-logged.
+> Unlike every other event in this table, `perm_ok` is emitted by a read-only
+> query (`has_permission`), not a state-mutating call — a granted permission
+> check is itself audit-logged. A **denied** check (`has_permission` returns
+> `false`) emits nothing: `has_permission` takes no auth, so any caller could
+> otherwise spam an arbitrary account's audit log with `perm_den` events for
+> permissions it never held, and it would violate the read-only-entrypoints
+> rule in [event-topic-conventions.md](event-topic-conventions.md).
 
 > `upgrade` emits no event — instance storage (including this event log's
 > continuity) survives the WASM replace, so there is nothing new to log; the
@@ -274,10 +299,144 @@ Contract tag: `mux_bat`
 
 | Action | Trigger | Data payload |
 |---|---|---|
+| `init` | `initialize` succeeds | `admin: Address` |
 | `bat_start` | `execute_batch` begins, before any operation runs | `(caller: Address, op_count: u32)` |
 | `executed` | `execute_batch` completes (success or partial failure) | `(caller: Address, success_count: u32, failure_count: u32)` |
 | `bat_ok` | `execute_batch` completes with zero failures | `(caller: Address, success_count: u32)` |
 | `bat_abort` | A `require_success=true` operation fails | `caller: Address` |
 | `sim_done` | `si
 
-/* … truncated 5167 chars — edit only what you need near the top … */
+|---|
+| `init` | `initialize` succeeds | `admin: Address` |
+| `bat_start` | `execute_batch` begins, before any operation runs | `(caller: Address, op_count: u32)` |
+| `executed` | `execute_batch` completes (success or partial failure) | `(caller: Address, success_count: u32, failure_count: u32)` |
+| `bat_ok` | `execute_batch` completes with zero failures | `(caller: Address, success_count: u32)` |
+| `bat_abort` | A `require_success=true` operation fails | `caller: Address` |
+| `sim_done` | `simulate_batch` writes no state but does emit `sim_done` for off-chain
+> observability. `upgrade` emits no event — see the note under
+> mux-permissions above; the same convention applies here. `initialize` is
+> optional and only establishes the `upgrade()` admin — batching itself
+> never required one.
+
+---
+
+## mux-spending-policy events
+
+Contract tag: `mux_spend`
+
+| Action | Trigger | Data payload |
+|---|---|---|
+| `init` | `initialize` succeeds | `admin: Address` |
+| `lmt_set` | `set_policy` succeeds | `(account: Address, asset: Address, limit: i128)` |
+| `chk_ok` | `check_spend` succeeds (within limit) | `(account: Address, asset: Address, amount: i128)` |
+| `chk_ex` | `check_spend` fails (exceeds limit or policy not found) | `(account: Address, asset: Address, amount: i128, limit_or_reason: i128 | Symbol)` |
+
+> `get_policy` is read-only and emits no events. `upgrade` emits no event —
+> the upload/invoke transaction is the audit record; the same convention
+> applies as for `mux-policy` and `mux-permissions`.
+
+---
+
+## mux-wallet-registry events
+
+Contract tag: `mux_wreg`
+
+| Action | Trigger | Data payload |
+|---|---|---|
+| `init` | `initialize` succeeds | `owner: Address` |
+| `wlt_reg` | `register_wallet` succeeds (new entry or overwrite) | `(name: Symbol, wallet: Address)` |
+| `wlt_meta` | `register_wallet_with_metadata` succeeds (new entry or overwrite) | `(name: Symbol, wallet: Address)` |
+
+> `get_wallet`, `get_metadata`, and `list_wallets` are read-only and emit no events.
+> `upgrade` emits no event — the upload/invoke transaction is the audit record;
+> the same convention applies as for `mux-policy` and `mux-permissions`.
+
+---
+
+## mux-registry events
+
+Contract tag: `mux_reg`
+
+| Action | Trigger | Data payload |
+|---|---|---|
+| `init` | `initialize` succeeds | `admin: Address` |
+| `reg` | `register` succeeds (new entry or version update) | `(name: Symbol, version: String)` |
+| `regmeta` | `register_with_metadata` succeeds (new entry or update) | `(name: Symbol, version: String)` |
+
+> `get_version`, `check_version`, `get_metadata`, and `list_contracts` are
+> read-only and emit no events. `upgrade` emits no event — the upload/invoke
+> transaction is the audit record; the same convention applies as for
+> `mux-policy` and `mux-permissions`.
+
+---
+
+## mux-recovery events
+
+Contract tag: `mux_recv`
+
+| Action | Trigger | Data payload |
+|---|---|---|
+| `init` | `initialize` succeeds | `owner: Address` |
+| `rec_init` | `initiate_recovery` succeeds | `(guardian, new_owner, initiated_at, executable_at, expires_at)` |
+| `rec_appr` | `approve_recovery` succeeds | `(guardian: Address, approval_count: u32)` |
+| `rec_exec` | `execute_recovery` succeeds | `(guardian: Address, new_owner: Address)` |
+| `rec_adm` | `approve_recovery_admin` succeeds | `(new_owner: Address, co_guardian: Address)` |
+| `rec_cncl` | `cancel_recovery` succeeds | `()` |
+| `grd_add` | `add_guardian` succeeds | `guardian: Address` |
+| `grd_rm` | `remove_guardian` succeeds | `guardian: Address` |
+| `qrm_set` | `set_quorum_threshold` succeeds | `threshold: u32` |
+| `reg_link` | `set_registry` succeeds | `registry_id: Address` |
+
+> The `rec_init` payload carries the full timelock window
+> (`initiated_at`/`executable_at`/`expires_at`) so indexers can compute
+> deadlines without a follow-up storage read. `RECOVERY_TIMELOCK` (17,280
+> ledgers ≈ 24h) and `RECOVERY_EXPIRY` (120,960 ledgers ≈ 7d) are stable ABI
+> — see [`docs/recovery-trust-model.md`](recovery-trust-model.md).
+> `owner`, `guardians`, `recovery_status`, `recovery_request`, and
+> `registry_id` are read-only and emit no events. `upgrade` emits no event —
+> the upload/invoke transaction is the audit record; the same convention
+> applies as for `mux-policy` and `mux-permissions`.
+
+---
+
+## mux-policy events
+
+Contract tag: `mux_pol`
+
+| Action | Trigger | Data payload |
+|---|---|---|
+| `init` | `initialize` succeeds | `admin: Address` |
+| `lmt_set` | `set_daily_limit` succeeds | `(wallet: Address, limit: i128, day_ledgers: u32)` |
+| `spent` | `record_spend` succeeds | `(wallet: Address, amount: i128)` |
+| `ctr_rst` | `reset_daily_counter` succeeds | `wallet: Address` |
+
+> `get_daily_limit` is read-only and emits no events; note it reports
+> `spent` as reset to `0` once the day window has elapsed without
+> persisting that reset (only `record_spend` and `reset_daily_counter`
+> actually write the reset). `upgrade` extends TTL but does not emit an
+> audit event of its own.
+
+---
+
+## Querying events
+
+Use the Soroban RPC `getEvents` endpoint, filtering by `contractId` and topic:
+
+```ts
+const events = await server.getEvents({
+  startLedger: fromLedger,
+  filters: [{
+    type: "contract",
+    contractIds: [CONTRACT_ID],
+    topics: [["mux_acct"], ["dlg_set"]],  // [topics[0] filter, topics[1] filter]
+  }],
+});
+```
+
+---
+
+## Security notes
+
+- Events are **append-only** and cannot be modified or deleted after emission.
+- Failed operations (those returning an error) do **not** emit events — only successful state changes are logged.
+- The `debited` event records the spend amount but not the cumulative total; reconstruct running totals by summing `debited` events between `lmt_set` resets.

@@ -179,7 +179,7 @@ Anyone calls has_permission("0xAlice", "transfer")
   ├─ (no auth required — read-only)
   ├─ Reads AccountRoles(0xAlice) → finds "operator"
   ├─ Reads RolePermissions("operator") → finds "transfer"
-  ├─ Event: action = perm_ok, data = (0xAlice, "transfer")
+  ├─ Event: action = perm_ok, data = (0xAlice, "transfer")  ← only on grant
   └─ Returns true
 ```
 
@@ -245,7 +245,6 @@ Contract tag: `mux_perm`
 | `role_grt` | `grant_role` succeeds (new grant) | `(account: Address, role: Symbol)` |
 | `role_rev` | `revoke_role` succeeds | `(account: Address, role: Symbol)` |
 | `perm_ok` | `has_permission` returns `true` | `(account: Address, permission: Symbol)` |
-| `perm_den` | `has_permission` returns `false` | `(account: Address, permission: Symbol)` |
 | `adm_thr` | `set_admin_threshold` succeeds | `threshold: u32` |
 | `adm_prp` | `propose_admin` adds a new candidate | `new_admin: Address` |
 | `adm_apr` | `approve_admin` records an approval (threshold not yet reached) | `(approver: Address, new_admin: Address)` |
@@ -254,7 +253,8 @@ Contract tag: `mux_perm`
 
 Events are **success-only**: failed operations (returning `Err`) emit no events.
 Read-only functions (`get_roles`, `get_role_members`, `get_admin_threshold`, etc.)
-emit no events.
+emit no events. `has_permission` is the one deliberate exception, and only in
+one direction: a granted check emits `perm_ok`; a denied check emits nothing.
 
 See [event-topic-conventions.md](event-topic-conventions.md) for topic layout rules
 and [audit-events.md](audit-events.md) for the full per-contract catalog.
@@ -282,7 +282,10 @@ job to extend TTL proactively; see [storage-griefing.md](storage-griefing.md).
 4. **Event data minimisation**: Event payloads contain only public identifiers
    (addresses, symbols, u32 threshold values). No secrets or sensitive data
    are published.
-5. **Read-only queries**: Permission checks (`has_permission`) emit events for
-   audit trail but do not require authentication. Off-chain indexers can
-   stream `perm_ok` / `perm_den` events.
+5. **Read-only queries**: Permission checks (`has_permission`) do not require
+   authentication. A granted check emits `perm_ok` for the audit trail; a
+   denied check emits nothing, since `has_permission` takes no auth and an
+   event on every denial would let any caller spam an arbitrary account's
+   audit log with `perm_den` entries for permissions it never held. Off-chain
+   indexers can stream `perm_ok` events.
 
